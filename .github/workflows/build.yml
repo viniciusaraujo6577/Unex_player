@@ -1,0 +1,109 @@
+name: Gerar APK Android
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # necessário para publicar a Release com o APK + version.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Instalar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: 'stable'
+          cache: true
+
+      # Assinatura estável: sem isso cada build usa uma chave debug nova e o
+      # Android recusa instalar a atualização por cima do app antigo (OTA).
+      # Crie o secret DEBUG_KEYSTORE_BASE64 (veja o README).
+      - name: Restaurar keystore de assinatura (opcional, recomendado)
+        env:
+          KS: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KS" ]; then
+            mkdir -p ~/.android
+            echo "$KS" | base64 -d > ~/.android/debug.keystore
+            echo "Keystore restaurada."
+          else
+            echo "::warning::Secret DEBUG_KEYSTORE_BASE64 ausente: a atualização OTA só instala se desinstalar o app antigo antes."
+          fi
+
+      - name: Recriar estrutura Flutter Android
+        run: |
+          rm -rf android
+          flutter create --org com.exemplo --project-name iptv_player --platforms=android .
+          flutter pub get
+
+      - name: Instalar código nativo (PiP, brilho, volume, detecção de TV)
+        run: |
+          DEST="android/app/src/main/kotlin/com/exemplo/iptv_player"
+          mkdir -p "$DEST"
+          find android/app/src/main -name 'MainActivity.*' -delete
+          cp native/MainActivity.kt "$DEST/MainActivity.kt"
+
+      - name: Configurar Android TV Launcher, Banner, PiP e Botão Voltar
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          sed -i 's/android:enableOnBackInvokedCallback="true"/android:enableOnBackInvokedCallback="false"/g' $MANIFEST
+          sed -i 's/<application/<application android:usesCleartextTraffic="true" android:banner="@mipmap\/ic_launcher"/' $MANIFEST
+          sed -i 's/<activity/<activity android:supportsPictureInPicture="true" android:resizeableActivity="true"/' $MANIFEST
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"\/>\n    <uses-feature android:name="android.hardware.touchscreen" android:required="false"\/>\n    <uses-feature android:name="android.software.leanback" android:required="false"\/>' $MANIFEST
+          sed -i 's/<category android:name="android.intent.category.LAUNCHER"\/>/<category android:name="android.intent.category.LAUNCHER"\/>\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER"\/>/' $MANIFEST
+          echo "----- Manifest final -----"
+          cat $MANIFEST
+
+      - name: Compilar APK Otimizado (Release Leve)
+        run: |
+          flutter build apk --release \
+            --target-platform android-arm,android-arm64 \
+            --tree-shake-icons \
+            --obfuscate \
+            --split-debug-info=build/debug-info \
+            --build-number=${{ github.run_number }} \
+            --dart-define=UPDATE_URL=https://github.com/${{ github.repository }}/releases/latest/download/version.json
+
+      - name: Gerar version.json (usado pela checagem de atualização)
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION_NAME=$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')
+          cp build/app/outputs/flutter-apk/app-release.apk app-release.apk
+          jq -n \
+            --argjson code ${{ github.run_number }} \
+            --arg name "$VERSION_NAME" \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_number }}/app-release.apk" \
+            --arg notes "${COMMIT_MSG:-Melhorias e correções.}" \
+            '{versionCode:$code, versionName:$name, apkUrl:$url, notes:$notes, force:false}' > version.json
+          cat version.json
+
+      - name: Publicar Release (APK + version.json)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: UNEX Vision ${{ github.run_number }}
+          make_latest: true
+          files: |
+            app-release.apk
+            version.json
+
+      - name: Disponibilizar APK para Download
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptv-player-apk-leve
+          path: build/app/outputs/flutter-apk/app-release.apk
